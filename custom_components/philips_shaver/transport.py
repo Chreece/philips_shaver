@@ -16,6 +16,11 @@ from typing import Callable
 from bleak import BleakClient
 from bleak_retry_connector import establish_connection as bleak_establish
 
+try:
+    from habluetooth.usage import ORIGINAL_BLEAK_CLIENT
+except ImportError:  # pragma: no cover - compatibility with the pinned old test stack
+    ORIGINAL_BLEAK_CLIENT = BleakClient
+
 from homeassistant.components.bluetooth import (
     HaScanner,
     async_last_service_info,
@@ -72,6 +77,41 @@ def _host_scanner_name_by_adapter(
     except Exception:  # noqa: BLE001
         return None
     return None
+
+
+def local_bluez_scanner_device_from_address(
+    hass: HomeAssistant, address: str
+):
+    """Return the strongest usable local HA Host scanner entry for address.
+
+    Philips shaver bonds are controller-local. A stock ESPHome Bluetooth
+    proxy may advertise the same device into Home Assistant, but it cannot
+    complete the LE Secure Connections pairing required by the shaver.
+    """
+    candidates = []
+    try:
+        for scanner_device in async_scanner_devices_by_address(
+            hass, address, connectable=True
+        ):
+            if not isinstance(scanner_device.scanner, HaScanner):
+                continue
+            rssi = getattr(scanner_device.advertisement, "rssi", None)
+            if rssi is not None and rssi <= -127:
+                continue
+            rank = rssi if isinstance(rssi, (int, float)) else -999
+            candidates.append((rank, scanner_device))
+    except Exception:  # noqa: BLE001
+        return None
+
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item[0])[1]
+
+
+def local_bluez_device_from_address(hass: HomeAssistant, address: str):
+    """Return a BLEDevice seen by a local HA Host/BlueZ scanner."""
+    scanner_device = local_bluez_scanner_device_from_address(hass, address)
+    return scanner_device.ble_device if scanner_device is not None else None
 
 
 def describe_connection_path(
@@ -426,9 +466,15 @@ class BleakTransport(ShaverTransport):
         return int(rssi)
 
     async def connect(self) -> None:
-        service_info = async_last_service_info(self._hass, self._address)
-        if not service_info:
-            raise TransportError(f"Device {self._address} not in range")
+        scanner_device = local_bluez_scanner_device_from_address(
+            self._hass, self._address
+        )
+        if not scanner_device:
+            raise TransportError(
+                f"Device {self._address} is not reachable via a local "
+                "Bluetooth adapter"
+            )
+        device = scanner_device.ble_device
 
         def _on_disconnect(_client):
             _LOGGER.info("%s: connection lost", self._address)
@@ -439,15 +485,17 @@ class BleakTransport(ShaverTransport):
                 self._disconnect_cb()
 
         self._client = await bleak_establish(
-            BleakClient,
-            service_info.device,
+            ORIGINAL_BLEAK_CLIENT,
+            device,
             "philips_shaver",
             disconnected_callback=_on_disconnect,
             timeout=15.0,
         )
-        self._connected_scanner = getattr(self._client, "_connected_scanner", None)
+        # ORIGINAL_BLEAK_CLIENT intentionally bypasses HA's scanner re-routing,
+        # so keep the selected Host scanner ourselves for RSSI reporting.
+        self._connected_scanner = scanner_device.scanner
         self._connection_path = describe_connection_path(
-            self._hass, self._client, service_info.device
+            self._hass, self._client, device
         )
         _LOGGER.info("%s: connected via %s", self._address, self._connection_path)
 
@@ -477,15 +525,18 @@ class BleakTransport(ShaverTransport):
     async def read_chars(self, char_uuids: list[str]) -> dict[str, bytes | None]:
         """Connect-read-disconnect pattern for polling."""
         results: dict[str, bytes | None] = {u: None for u in char_uuids}
-        service_info = async_last_service_info(self._hass, self._address)
-        if not service_info:
-            _LOGGER.warning("Device %s not in range", self._address)
+        device = local_bluez_device_from_address(self._hass, self._address)
+        if not device:
+            _LOGGER.warning(
+                "Device %s not reachable via a local Bluetooth adapter",
+                self._address,
+            )
             return results
 
         client: BleakClient | None = None
         try:
             client = await bleak_establish(
-                BleakClient, service_info.device, "philips_shaver", timeout=15.0
+                ORIGINAL_BLEAK_CLIENT, device, "philips_shaver", timeout=15.0
             )
             if not client or not client.is_connected:
                 return results
