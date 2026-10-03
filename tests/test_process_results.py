@@ -10,8 +10,12 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from custom_components.philips_shaver.const import (
+    LIGHTRING_DEFAULT_COLORS,
     CHAR_BATTERY_LEVEL,
     CHAR_DEVICE_STATE,
+    CHAR_LIGHTRING_COLOR_MOTION,
+    CHAR_LIGHTRING_COLOR_OK,
+    CHAR_PRESSURE,
     CHAR_TOTAL_AGE,
     CHAR_TOTAL_RUNNING_MOTOR,
 )
@@ -105,3 +109,15 @@ def test_total_running_motor_parses_uint16_le() -> None:
     assert data["total_running_motor"] == 0x97
     data = process({CHAR_TOTAL_RUNNING_MOTOR: bytes.fromhex("ffff")})
     assert data["total_running_motor"] == 65535
+
+
+def test_pressure_parses_signed_int16_le() -> None:
+    """Below zero must stay below zero, not wrap to ~65 000 (too high)."""
+    assert process({CHAR_PRESSURE: bytes.fromhex("fbff")})["pressure"] == -5
+    assert process({CHAR_PRESSURE: bytes.fromhex("0000")})["pressure"] == 0
+    assert process({CHAR_PRESSURE: bytes.fromhex("a00f")})["pressure"] == 4000
+
+
+def test_default_ring_colors_ok_green_motion_pink() -> None:
+    assert LIGHTRING_DEFAULT_COLORS[CHAR_LIGHTRING_COLOR_OK] == (0x37, 0xFF, 0x00)
+    assert LIGHTRING_DEFAULT_COLORS[CHAR_LIGHTRING_COLOR_MOTION] == (0xFF, 0x49, 0xFF)

@@ -657,9 +657,10 @@ class PhilipsShaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if raw := results.get(CHAR_CUSTOM_SHAVING_MODE_SETTINGS):
             new_data["custom_shaving_settings"] = parse_shaving_settings_to_dict(raw)
 
-        # Pressure
+        # Pressure is a signed int16; read unsigned, a value below zero
+        # turned into ~65 000 and showed as far too high.
         if raw := results.get(CHAR_PRESSURE):
-            pressure_value = int.from_bytes(raw, "little")
+            pressure_value = int.from_bytes(raw[:2], "little", signed=True)
             new_data["pressure"] = pressure_value
 
         # Total Age
