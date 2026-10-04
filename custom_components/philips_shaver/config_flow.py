@@ -38,11 +38,6 @@ from homeassistant.components.bluetooth import (
 )
 from homeassistant.data_entry_flow import AbortFlow
 from bleak import BleakClient
-
-try:
-    from habluetooth.usage import ORIGINAL_BLEAK_CLIENT
-except ImportError:  # pragma: no cover - compatibility with the pinned old test stack
-    ORIGINAL_BLEAK_CLIENT = BleakClient
 from bleak.exc import BleakError
 from bleak_retry_connector import (
     BleakAbortedError,
@@ -107,6 +102,8 @@ from .transport import (
     async_unpair_bridge_slot,
     describe_available_paths,
     describe_connection_path,
+    is_local_bluez_connection,
+    local_bluez_client_class,
     local_bluez_device_from_address,
     slot_changed_at,
 )
@@ -688,7 +685,7 @@ class PhilipsShaverConfigFlow(ConfigFlow, domain=DOMAIN):
             )
             try:
                 client = await establish_connection(
-                    ORIGINAL_BLEAK_CLIENT, device, "philips_shaver",
+                    local_bluez_client_class(), device, "philips_shaver",
                     use_services_cache=True, timeout=30.0,
                 )
             finally:
@@ -696,13 +693,18 @@ class PhilipsShaverConfigFlow(ConfigFlow, domain=DOMAIN):
 
             if not client.is_connected:
                 raise CannotConnectException("BLE connection failed")
+
+            connection_path = describe_connection_path(self.hass, client, device)
+            if not is_local_bluez_connection(client):
+                raise CannotConnectException(
+                    f"Direct Bluetooth connection was routed through "
+                    f"{connection_path} instead of a local adapter"
+                )
+
             _LOGGER.info("Connected to %s, address=%s", device.name, address)
             self._bump_progress(0.4)
 
-            capabilities["connection_path"] = describe_connection_path(
-                self.hass, client, device
-            )
-            # This connection was deliberately opened on local BlueZ.
+            capabilities["connection_path"] = connection_path
             self._probe_via_proxy = False
             self._probe_proxy_name = None
             _LOGGER.info(

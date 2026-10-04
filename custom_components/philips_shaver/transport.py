@@ -14,12 +14,9 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable
 
 from bleak import BleakClient
+from bleak.exc import BleakError
 from bleak_retry_connector import establish_connection as bleak_establish
-
-try:
-    from habluetooth.usage import ORIGINAL_BLEAK_CLIENT
-except ImportError:  # pragma: no cover - compatibility with the pinned old test stack
-    ORIGINAL_BLEAK_CLIENT = BleakClient
+from habluetooth.usage import HaBleakClientWithServiceCache
 
 from homeassistant.components.bluetooth import (
     HaScanner,
@@ -245,6 +242,79 @@ def is_local_bluez_connection(client: BleakClient) -> bool:
         return "bluezdbus" in (type(backend).__module__ or "")
     except Exception:  # noqa: BLE001
         return False
+
+
+class _LocalBluezHaBleakClient(HaBleakClientWithServiceCache):
+    """HA BLE client that only considers local BlueZ scanners."""
+
+    def _async_get_best_available_backend_and_device(self, manager):
+        """Select a HA-managed backend from local adapters only.
+
+        These are private habluetooth hooks. If their signature changes, fall
+        back to HA's normal selector; callers still verify the connected
+        backend with is_local_bluez_connection() before using it.
+        """
+        try:
+            address = self._HaBleakClientWrapper__address  # noqa: SLF001
+            backend_for_device = getattr(
+                self, "_async_get_backend_for_ble_device"
+            )
+            local_devices = [
+                item
+                for item in manager.async_scanner_devices_by_address(address, True)
+                if isinstance(item.scanner, HaScanner)
+            ]
+            local_devices.sort(
+                key=lambda item: (
+                    item.advertisement.rssi
+                    if isinstance(item.advertisement.rssi, (int, float))
+                    else -999
+                ),
+                reverse=True,
+            )
+
+            for item in local_devices:
+                backend = backend_for_device(
+                    manager, item.scanner, item.ble_device
+                )
+                if backend is not None:
+                    return backend
+
+            if local_devices:
+                raise BleakError(
+                    f"No local Bluetooth adapter with an available connection "
+                    f"slot can reach {address}"
+                )
+            raise BleakError(
+                f"No local Bluetooth adapter can currently reach {address}"
+            )
+        except (AttributeError, TypeError):
+            _LOGGER.warning(
+                "habluetooth private backend-selection API changed; "
+                "falling back to normal HA selection and verifying the "
+                "connected adapter afterwards",
+                exc_info=True,
+            )
+            fallback = getattr(
+                super(), "_async_get_best_available_backend_and_device", None
+            )
+            if fallback is None:
+                raise BleakError(
+                    "habluetooth no longer exposes the backend-selection hook "
+                    "required to pin Direct Bluetooth to a local adapter"
+                )
+            return fallback(manager)
+
+
+def local_bluez_client_class():
+    """Return the pinned HA client, or normal HA client if hooks disappeared."""
+    required_hooks = (
+        "_async_get_best_available_backend_and_device",
+        "_async_get_backend_for_ble_device",
+    )
+    if all(hasattr(HaBleakClientWithServiceCache, hook) for hook in required_hooks):
+        return _LocalBluezHaBleakClient
+    return HaBleakClientWithServiceCache
 
 
 # Return values of async_unpair_bridge_slot.
@@ -484,18 +554,31 @@ class BleakTransport(ShaverTransport):
             if self._disconnect_cb:
                 self._disconnect_cb()
 
-        self._client = await bleak_establish(
-            ORIGINAL_BLEAK_CLIENT,
+        client = await bleak_establish(
+            local_bluez_client_class(),
             device,
             "philips_shaver",
             disconnected_callback=_on_disconnect,
             timeout=15.0,
         )
-        # ORIGINAL_BLEAK_CLIENT intentionally bypasses HA's scanner re-routing,
-        # so keep the selected Host scanner ourselves for RSSI reporting.
-        self._connected_scanner = scanner_device.scanner
+        if not is_local_bluez_connection(client):
+            path = describe_connection_path(self._hass, client, device)
+            try:
+                if client.is_connected:
+                    await client.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+            raise TransportError(
+                f"Device {self._address} connected via {path}, not a local "
+                "Bluetooth adapter"
+            )
+
+        self._client = client
+        self._connected_scanner = (
+            getattr(client, "_connected_scanner", None) or scanner_device.scanner
+        )
         self._connection_path = describe_connection_path(
-            self._hass, self._client, device
+            self._hass, client, device
         )
         _LOGGER.info("%s: connected via %s", self._address, self._connection_path)
 
@@ -536,10 +619,19 @@ class BleakTransport(ShaverTransport):
         client: BleakClient | None = None
         try:
             client = await bleak_establish(
-                ORIGINAL_BLEAK_CLIENT, device, "philips_shaver", timeout=15.0
+                local_bluez_client_class(),
+                device,
+                "philips_shaver",
+                timeout=15.0,
             )
             if not client or not client.is_connected:
                 return results
+            if not is_local_bluez_connection(client):
+                path = describe_connection_path(self._hass, client, device)
+                raise TransportError(
+                    f"Device {self._address} connected via {path}, not a local "
+                    "Bluetooth adapter"
+                )
 
             for uuid in char_uuids:
                 try:
