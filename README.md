@@ -1,3 +1,10 @@
+<!-- ko-fi-support -->
+<p align="center">
+  <a href="https://ko-fi.com/chreece">
+    <img src="https://raw.githubusercontent.com/Chreece/pir2ha/main/.github/ko-fi-banner.svg" alt="Support Chreece on Ko-fi" width="600">
+  </a>
+</p>
+
 # Philips Shaver Integration for Home Assistant
 
 [![HACS Default](https://img.shields.io/badge/HACS-Default-41BDF5.svg)](https://github.com/hacs/default)
