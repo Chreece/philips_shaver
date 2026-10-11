@@ -508,6 +508,9 @@ class BleakTransport(ShaverTransport):
         self._last_read_errors: dict[str, str] = {}
         self._connection_path: str | None = None
         self._connected_scanner = None
+        # Serialize all local BLE connect/disconnect operations. The
+        # coordinator lock does not cover services and direct transport users.
+        self._connect_lock = asyncio.Lock()
 
     @property
     def is_connected(self) -> bool:
@@ -536,59 +539,100 @@ class BleakTransport(ShaverTransport):
         return int(rssi)
 
     async def connect(self) -> None:
-        scanner_device = local_bluez_scanner_device_from_address(
-            self._hass, self._address
-        )
-        if not scanner_device:
-            raise TransportError(
-                f"Device {self._address} is not reachable via a local "
-                "Bluetooth adapter"
-            )
-        device = scanner_device.ble_device
+        # A failed live-setup may leave a perfectly good BLE link up. Never
+        # open a second connection to the same bonded shaver, including when
+        # two callers arrive while establish_connection() is still running.
+        async with self._connect_lock:
+            if self.is_connected:
+                return
 
-        def _on_disconnect(_client):
-            _LOGGER.info("%s: connection lost", self._address)
             self._client = None
             self._connection_path = None
             self._connected_scanner = None
-            if self._disconnect_cb:
-                self._disconnect_cb()
+            scanner_device = local_bluez_scanner_device_from_address(
+                self._hass, self._address
+            )
+            if not scanner_device:
+                raise TransportError(
+                    f"Device {self._address} is not reachable via a local "
+                    "Bluetooth adapter"
+                )
+            device = scanner_device.ble_device
 
-        client = await bleak_establish(
-            local_bluez_client_class(),
-            device,
-            "philips_shaver",
-            disconnected_callback=_on_disconnect,
-            timeout=15.0,
-        )
-        if not is_local_bluez_connection(client):
-            path = describe_connection_path(self._hass, client, device)
-            try:
-                if client.is_connected:
-                    await client.disconnect()
-            except Exception:  # noqa: BLE001
-                pass
-            raise TransportError(
-                f"Device {self._address} connected via {path}, not a local "
-                "Bluetooth adapter"
+            def _on_disconnect(disconnected_client):
+                # Bleak callbacks can arrive after a retry established a new
+                # link. A callback from the previous link must not clear it.
+                if disconnected_client is not self._client:
+                    _LOGGER.debug(
+                        "%s: ignoring stale BLE disconnect callback", self._address
+                    )
+                    return
+                _LOGGER.info("%s: connection lost", self._address)
+                self._client = None
+                self._connection_path = None
+                self._connected_scanner = None
+                if self._disconnect_cb:
+                    self._disconnect_cb()
+
+            client = await bleak_establish(
+                local_bluez_client_class(),
+                device,
+                "philips_shaver",
+                disconnected_callback=_on_disconnect,
+                timeout=15.0,
+            )
+            if not client.is_connected:
+                raise TransportError(
+                    f"Device {self._address} disconnected during BLE setup"
+                )
+
+            # Preserve PR #19's local-adapter requirement even when the
+            # private habluetooth backend selector falls back.
+            if not is_local_bluez_connection(client):
+                path = describe_connection_path(self._hass, client, device)
+                try:
+                    if client.is_connected:
+                        await client.disconnect()
+                except Exception:  # noqa: BLE001
+                    _LOGGER.debug(
+                        "%s: failed to disconnect nonlocal BLE client",
+                        self._address,
+                        exc_info=True,
+                    )
+                raise TransportError(
+                    f"Device {self._address} connected via {path}, not a local "
+                    "Bluetooth adapter"
+                )
+
+            self._client = client
+            self._connected_scanner = (
+                getattr(client, "_connected_scanner", None)
+                or scanner_device.scanner
+            )
+            self._connection_path = describe_connection_path(
+                self._hass, client, device
+            )
+            _LOGGER.info(
+                "%s: connected via %s", self._address, self._connection_path
             )
 
-        self._client = client
-        self._connected_scanner = (
-            getattr(client, "_connected_scanner", None) or scanner_device.scanner
-        )
-        self._connection_path = describe_connection_path(
-            self._hass, client, device
-        )
-        _LOGGER.info("%s: connected via %s", self._address, self._connection_path)
-
     async def disconnect(self) -> None:
-        if self._client and self._client.is_connected:
-            try:
-                await self._client.disconnect()
-            except Exception:
-                pass
-        self._client = None
+        async with self._connect_lock:
+            client = self._client
+            # Detach before awaiting BlueZ. Any late callback from this
+            # intentional disconnect must not affect a later connection.
+            self._client = None
+            self._connection_path = None
+            self._connected_scanner = None
+            if client is not None and client.is_connected:
+                try:
+                    await client.disconnect()
+                except Exception:  # noqa: BLE001
+                    _LOGGER.debug(
+                        "%s: error disconnecting BLE client",
+                        self._address,
+                        exc_info=True,
+                    )
 
     def pop_read_error(self, char_uuid: str) -> str | None:
         """Return and clear the last read error for a characteristic, if any."""
