@@ -954,6 +954,14 @@ class PhilipsShaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     except Exception:
                         pass
 
+                    # A failed connect may not have produced a client, hence
+                    # no Bleak disconnect callback. Always clear the transient
+                    # "initializing" state after a failed direct-BLE setup.
+                    if not self._is_esp_bridge and self.data:
+                        self.data["device_state"] = "off"
+                        self.data.pop("_connecting", None)
+                        self.async_set_updated_data(self.data)
+
                     if not self._is_esp_bridge:
                         # Direct BLE: quick retries, then wait for ADV
                         for attempt in range(MAX_QUICK_RETRIES):
