@@ -398,6 +398,8 @@ class BleakTransport(ShaverTransport):
         self._last_read_errors: dict[str, str] = {}
         self._connection_path: str | None = None
         self._connected_scanner = None
+        # Covers external transport users as well as the coordinator's lock.
+        self._connect_lock = asyncio.Lock()
 
     @property
     def is_connected(self) -> bool:
@@ -426,38 +428,82 @@ class BleakTransport(ShaverTransport):
         return int(rssi)
 
     async def connect(self) -> None:
-        service_info = async_last_service_info(self._hass, self._address)
-        if not service_info:
-            raise TransportError(f"Device {self._address} not in range")
+        # Reuse the live connection after a partial setup failure, and do not
+        # race a second connection against one still in progress.
+        async with self._connect_lock:
+            if self.is_connected:
+                return
 
-        def _on_disconnect(_client):
-            _LOGGER.info("%s: connection lost", self._address)
+            # A disconnected client is no longer authoritative. Its delayed
+            # callback must not clear a replacement connection.
             self._client = None
             self._connection_path = None
             self._connected_scanner = None
-            if self._disconnect_cb:
-                self._disconnect_cb()
 
-        self._client = await bleak_establish(
-            BleakClient,
-            service_info.device,
-            "philips_shaver",
-            disconnected_callback=_on_disconnect,
-            timeout=15.0,
-        )
-        self._connected_scanner = getattr(self._client, "_connected_scanner", None)
-        self._connection_path = describe_connection_path(
-            self._hass, self._client, service_info.device
-        )
-        _LOGGER.info("%s: connected via %s", self._address, self._connection_path)
+            service_info = async_last_service_info(self._hass, self._address)
+            if not service_info:
+                raise TransportError(f"Device {self._address} not in range")
+
+            def _on_disconnect(disconnected_client):
+                if disconnected_client is not self._client:
+                    _LOGGER.debug(
+                        "%s: ignoring stale BLE disconnect callback", self._address
+                    )
+                    return
+                _LOGGER.info("%s: connection lost", self._address)
+                self._client = None
+                self._connection_path = None
+                self._connected_scanner = None
+                if self._disconnect_cb:
+                    self._disconnect_cb()
+
+            client = await bleak_establish(
+                BleakClient,
+                service_info.device,
+                "philips_shaver",
+                disconnected_callback=_on_disconnect,
+                timeout=15.0,
+            )
+            if not client.is_connected:
+                raise TransportError(
+                    f"Device {self._address} disconnected during BLE setup"
+                )
+
+            self._client = client
+            self._connected_scanner = getattr(
+                client, "_connected_scanner", None
+            )
+            self._connection_path = describe_connection_path(
+                self._hass, client, service_info.device
+            )
+            _LOGGER.info(
+                "%s: connected via %s", self._address, self._connection_path
+            )
 
     async def disconnect(self) -> None:
-        if self._client and self._client.is_connected:
+        # Intentional disconnects must notify the coordinator exactly once.
+        # Detach before calling BlueZ so its delayed callback cannot clear a
+        # newly established connection or emit a duplicate state update.
+        async with self._connect_lock:
+            client = self._client
+            self._client = None
+            self._connection_path = None
+            self._connected_scanner = None
+            if client is None:
+                return
+
             try:
-                await self._client.disconnect()
-            except Exception:
-                pass
-        self._client = None
+                if client.is_connected:
+                    await client.disconnect()
+            except Exception:  # noqa: BLE001
+                _LOGGER.debug(
+                    "%s: error disconnecting BLE client",
+                    self._address,
+                    exc_info=True,
+                )
+            finally:
+                if self._disconnect_cb:
+                    self._disconnect_cb()
 
     def pop_read_error(self, char_uuid: str) -> str | None:
         """Return and clear the last read error for a characteristic, if any."""
