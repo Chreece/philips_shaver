@@ -754,9 +754,23 @@ class PhilipsShaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         Both modes are event-driven — no blind retries.
         """
-        MAX_QUICK_RETRIES = 2  # quick retries after unexpected disconnect (Direct BLE only)
+        # Allow the controller time to recover after a failed setup. Do not
+        # stack blind retries on bleak_retry_connector's own connection retries.
+        DIRECT_RETRY_BASE_SECONDS = 30
+        DIRECT_RETRY_MAX_SECONDS = 300
+        direct_failures = 0
+        direct_retry_delay = 0.0
 
         while True:
+            if direct_retry_delay:
+                # Never hold _connection_lock across this backoff: history
+                # reads and clean shutdown still need access to the transport.
+                await asyncio.sleep(direct_retry_delay)
+                direct_retry_delay = 0.0
+                # An ADV received during cooldown may be stale now. Require
+                # a new advertisement after the cooldown has finished.
+                self._consume_wake()
+
             # ---- Wait for device to be available ----
             # Direct BLE: wait for ADV/D-Bus signal
             # ESP bridge: skips — connect() sets up listeners, then we wait below
@@ -776,6 +790,15 @@ class PhilipsShaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     self._clear_adv_history()
                     _LOGGER.debug("Waiting for advertisement from %s...", self.address)
                     await self._wake_event.wait()
+                    if not self._adv_wake:
+                        # The disconnect callback also sets this event. It
+                        # must never authorize another blind connection.
+                        self._consume_wake()
+                        _LOGGER.debug(
+                            "%s: wake without ADV; staying disconnected",
+                            self.address,
+                        )
+                        continue
                     self._consume_wake()
                     _LOGGER.info("Advertisement received — connecting to %s", self.address)
 
@@ -824,8 +847,16 @@ class PhilipsShaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
                     self.transport.set_disconnect_callback(_on_state_change)
 
-                    _LOGGER.info("Establishing live connection to %s...", self.address)
-                    await self.transport.connect()
+                    if not self.transport.is_connected:
+                        _LOGGER.info(
+                            "Establishing live connection to %s...", self.address
+                        )
+                        await self.transport.connect()
+                    else:
+                        _LOGGER.debug(
+                            "%s: reusing existing BLE connection for live setup",
+                            self.address,
+                        )
 
                     # ESP bridge: wait for BLE device to actually connect
                     if self._is_esp_bridge and not self.transport.is_connected:
@@ -908,6 +939,8 @@ class PhilipsShaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     if sub_count == 0:
                         raise TransportError("No notifications could be subscribed")
                     self._live_setup_done = True
+                    if not self._is_esp_bridge:
+                        direct_failures = 0
                     if self.data:
                         self.data.pop("_connecting", None)
                     _LOGGER.info("%s: live monitoring active (%d subscriptions)", self.address, sub_count)
@@ -939,24 +972,18 @@ class PhilipsShaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         pass
 
                     if not self._is_esp_bridge:
-                        # Direct BLE: quick retries, then wait for ADV
-                        for attempt in range(MAX_QUICK_RETRIES):
-                            await asyncio.sleep(5)
-                            if self._wake_event.is_set():
-                                break
-                            _LOGGER.debug(
-                                "Quick retry %d/%d for %s...",
-                                attempt + 1, MAX_QUICK_RETRIES, self.address,
-                            )
-                            try:
-                                await self.transport.connect()
-                                break
-                            except Exception:
-                                try:
-                                    await self.transport.disconnect()
-                                except Exception:
-                                    pass
-                        # If still not connected, loop back to ADV wait
+                        direct_failures += 1
+                        direct_retry_delay = min(
+                            DIRECT_RETRY_MAX_SECONDS,
+                            DIRECT_RETRY_BASE_SECONDS
+                            * 2 ** min(direct_failures - 1, 4),
+                        )
+                        _LOGGER.info(
+                            "%s: failed BLE setup; cooling down for %.0fs "
+                            "then waiting for a fresh advertisement",
+                            self.address,
+                            direct_retry_delay,
+                        )
                     else:
                         # ESP bridge: wait for next ready event before retrying
                         self._wake_event.clear()
