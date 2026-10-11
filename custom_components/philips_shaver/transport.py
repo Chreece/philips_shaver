@@ -244,6 +244,14 @@ def is_local_bluez_connection(client: BleakClient) -> bool:
         return False
 
 
+def _scanner_device_label(item) -> str:
+    """Return 'scanner (rssi dBm)' for a debug line, never raising."""
+    scanner = getattr(item, "scanner", None)
+    name = getattr(scanner, "name", None) or getattr(scanner, "source", "?")
+    rssi = getattr(getattr(item, "advertisement", None), "rssi", None)
+    return f"{name} ({rssi} dBm)"
+
+
 class _LocalBluezHaBleakClient(HaBleakClientWithServiceCache):
     """HA BLE client that only considers local BlueZ scanners."""
 
@@ -259,10 +267,9 @@ class _LocalBluezHaBleakClient(HaBleakClientWithServiceCache):
             backend_for_device = getattr(
                 self, "_async_get_backend_for_ble_device"
             )
+            all_devices = manager.async_scanner_devices_by_address(address, True)
             local_devices = [
-                item
-                for item in manager.async_scanner_devices_by_address(address, True)
-                if isinstance(item.scanner, HaScanner)
+                item for item in all_devices if isinstance(item.scanner, HaScanner)
             ]
             local_devices.sort(
                 key=lambda item: (
@@ -278,6 +285,21 @@ class _LocalBluezHaBleakClient(HaBleakClientWithServiceCache):
                     manager, item.scanner, item.ble_device
                 )
                 if backend is not None:
+                    # Shows whether the pin overrode a remote scanner that
+                    # HA's own selector might have preferred.
+                    if _LOGGER.isEnabledFor(logging.DEBUG):
+                        _LOGGER.debug(
+                            "%s: Direct Bluetooth pinned to %s; "
+                            "skipped remote scanners: %s",
+                            address,
+                            _scanner_device_label(item),
+                            ", ".join(
+                                _scanner_device_label(other)
+                                for other in all_devices
+                                if not isinstance(other.scanner, HaScanner)
+                            )
+                            or "none",
+                        )
                     return backend
 
             if local_devices:

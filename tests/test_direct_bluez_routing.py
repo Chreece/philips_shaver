@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -138,6 +139,41 @@ def test_ha_client_selector_only_considers_local_scanners(monkeypatch) -> None:
 
     assert selected is backend
     assert calls == [(manager, local_scanner, local_device)]
+
+
+def test_ha_client_selector_logs_skipped_remote_scanners(monkeypatch, caplog) -> None:
+    class LocalScanner:
+        name = "hci0"
+
+    local = SimpleNamespace(
+        scanner=LocalScanner(),
+        advertisement=SimpleNamespace(rssi=-76),
+        ble_device=SimpleNamespace(address=ADDRESS),
+    )
+    proxy = SimpleNamespace(
+        scanner=SimpleNamespace(name="atom-s3r"),
+        advertisement=SimpleNamespace(rssi=-58),
+        ble_device=SimpleNamespace(address=ADDRESS),
+    )
+    manager = SimpleNamespace(
+        async_scanner_devices_by_address=MagicMock(return_value=[proxy, local])
+    )
+    client = object.__new__(tr._LocalBluezHaBleakClient)
+    client._HaBleakClientWrapper__address = ADDRESS  # noqa: SLF001
+    monkeypatch.setattr(tr, "HaScanner", LocalScanner)
+    monkeypatch.setattr(
+        tr._LocalBluezHaBleakClient,
+        "_async_get_backend_for_ble_device",
+        lambda self, manager_arg, scanner, device: object(),
+    )
+
+    with caplog.at_level(logging.DEBUG, logger=tr.__name__):
+        client._async_get_best_available_backend_and_device(manager)
+
+    assert (
+        f"{ADDRESS}: Direct Bluetooth pinned to hci0 (-76 dBm); "
+        "skipped remote scanners: atom-s3r (-58 dBm)"
+    ) in caplog.text
 
 
 def test_ha_client_selector_falls_back_if_private_hook_changes(monkeypatch) -> None:
